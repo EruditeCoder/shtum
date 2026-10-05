@@ -1,0 +1,8 @@
+/target
+# Local agent state: settings, locks and scheduled tasks are per machine
+.claude/
+# A vault or env file must never be committed here
+.env
+.env.*
+!.env.example
+*.age

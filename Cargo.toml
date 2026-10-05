@@ -1,0 +1,37 @@
+[package]
+name = "shtum"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+repository = "https://github.com/EruditeCoder/shtum"
+homepage = "https://github.com/EruditeCoder/shtum"
+description = "API keys and everything known about them, for people working with AI agents: agents read and write the metadata, and never see a value"
+license = "MIT"
+readme = "README.md"
+keywords = ["secrets", "api-keys", "agents", "mcp", "age"]
+categories = ["command-line-utilities", "cryptography"]
+
+[dependencies]
+age = { version = "0.12.1", features = ["armor"] }
+anyhow = "1.0.104"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde", "std"] }
+clap = { version = "4.6.7", features = ["derive"] }
+getrandom = "0.4.3"
+hex = "0.4.3"
+libc = "0.2.190"
+rpassword = "7.5.4"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+toml = "1.1.6"
+zeroize = "1.9.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6.2"
+objc2 = "0.6.4"
+objc2-foundation = "0.3.2"
+objc2-local-authentication = { version = "0.3.2", features = ["LAContext", "block2"] }
+security-framework = "3.7.0"
+
+[dev-dependencies]
+tempfile = "3.27.0"
