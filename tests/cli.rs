@@ -403,7 +403,7 @@ fn fly_sync_pipes_values_to_fly_and_masks_its_output() {
     std::fs::create_dir(&bin).unwrap();
     let got = e.dir.path().join("fly-stdin");
     let fake = format!(
-        "#!/bin/sh\necho \"args: $*\"\ncat > {}\ncat {}\n",
+        "#!/bin/sh\n[ \"$2\" = list ] && echo '[]' && exit 0\necho \"args: $*\"\ncat > {}\ncat {}\n",
         got.display(),
         got.display()
     );
@@ -709,4 +709,313 @@ fn the_mcp_server_declares_without_a_value() {
     assert!(!files_under(&e.home()).iter().any(
         |f| f.extension().is_some_and(|x| x == "age") && f.to_string_lossy().contains("STRIPE")
     ));
+}
+
+// --- compare, check and fly diff ---------------------------------------------------------
+
+const STRIPE_FAKE: &str = "sk_live_fake-not-a-key";
+const RESEND_FAKE: &str = "re_fake-not-a-key";
+
+#[test]
+fn compare_says_same_or_different_and_stores_nothing() {
+    let e = Env::new();
+    e.with_secrets();
+    let before =
+        std::fs::read_to_string(e.home().join("vault/secrets/prod/RESEND_API_KEY.toml")).unwrap();
+    let out = e.shtum(
+        &["compare", "RESEND_API_KEY", "--env", "prod"],
+        Some(&format!("{LIVE}\n")),
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(
+        text(&out).contains("same as the stored value"),
+        "{}",
+        text(&out)
+    );
+    let out = e.shtum(
+        &["compare", "RESEND_API_KEY", "--env", "prod"],
+        Some("something-else-entirely"),
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(text(&out).contains("DIFFERENT"), "{}", text(&out));
+    assert!(!text(&out).contains("something-else") && !text(&out).contains(LIVE));
+    let out = e.shtum(&["compare", "NOPE", "--env", "prod"], Some("x"));
+    assert!(text(&out).contains("not in shtum"), "{}", text(&out));
+    let after =
+        std::fs::read_to_string(e.home().join("vault/secrets/prod/RESEND_API_KEY.toml")).unwrap();
+    assert_eq!(before, after, "compare must not touch the record");
+
+    // A whole file: one same, one different, one not stored.
+    let f = e.write(
+        "held.env",
+        &format!("RESEND_API_KEY={LIVE}\nSTRIPE_KEY=other-value-123\nNEW_ONE=zzz\n"),
+    );
+    let out = e.shtum(
+        &["compare", "--file", f.to_str().unwrap(), "--env", "prod"],
+        None,
+    );
+    let t = text(&out);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(t.contains("RESEND_API_KEY") && t.contains("same as"), "{t}");
+    assert!(t.contains("STRIPE_KEY") && t.contains("DIFFERENT"), "{t}");
+    assert!(t.contains("NEW_ONE") && t.contains("not in shtum"), "{t}");
+    assert!(!t.contains("other-value") && !t.contains(LIVE));
+}
+
+#[test]
+fn compare_recognises_an_earlier_value_and_a_different_kind() {
+    let e = Env::new();
+    e.ok(
+        &["set", "STRIPE_SECRET_KEY", "--env", "dev"],
+        Some("sk_test_fake-old-one"),
+    );
+    e.ok(
+        &["set", "STRIPE_SECRET_KEY", "--env", "dev"],
+        Some(STRIPE_FAKE),
+    );
+    let t = text(&e.shtum(
+        &["compare", "STRIPE_SECRET_KEY", "--env", "dev"],
+        Some("sk_test_fake-old-one"),
+    ));
+    assert!(t.contains("earlier value"), "{t}");
+    assert!(
+        t.contains("Stripe secret key (test)") && t.contains("Stripe secret key (live)"),
+        "{t}"
+    );
+}
+
+/// A stand-in for every provider: answers by the key it is sent, and records what arrived.
+fn providers() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use std::io::{BufRead, BufReader};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        for conn in listener.incoming().flatten() {
+            let mut reader = BufReader::new(conn.try_clone().unwrap());
+            let mut first = String::new();
+            reader.read_line(&mut first).unwrap();
+            let mut auth = String::new();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                let lower = line.to_ascii_lowercase();
+                if lower.starts_with("authorization:") || lower.starts_with("x-api-key:") {
+                    auth = line.trim().to_string();
+                }
+            }
+            let path = first.split_whitespace().nth(1).unwrap_or("").to_string();
+            log.lock().unwrap().push(format!("{path} {auth}"));
+            let (status, body) = if auth.contains(STRIPE_FAKE) && path == "/v1/account" {
+                (
+                    "200 OK",
+                    r#"{"id":"acct_123","settings":{"dashboard":{"display_name":"Acme"}},"email":"owner@example.com"}"#,
+                )
+            } else {
+                (
+                    "401 Unauthorized",
+                    r#"{"error":{"message":"Invalid API Key provided: re_****-key"}}"#,
+                )
+            };
+            let mut w = conn;
+            let _ = write!(
+                w,
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    (base, seen)
+}
+
+#[test]
+fn check_asks_each_provider_and_records_what_it_said() {
+    let e = Env::new();
+    e.ok(
+        &["set", "STRIPE_SECRET_KEY", "--env", "prod"],
+        Some(STRIPE_FAKE),
+    );
+    e.ok(
+        &["set", "RESEND_API_KEY", "--env", "prod"],
+        Some(RESEND_FAKE),
+    );
+    e.ok(
+        &["set", "MYSTERY", "--env", "prod"],
+        Some("no-telling-prefix-here"),
+    );
+    let show = e.ok(&["show", "STRIPE_SECRET_KEY", "--env", "prod"], None);
+    assert!(
+        show.contains("kind: Stripe secret key (live)"),
+        "kind is read when stored: {show}"
+    );
+
+    let (base, seen) = providers();
+    let mut c = e.cmd(&["check", "--env", "prod"]);
+    c.env("SHTUM_TEST_PROVIDER_BASE", &base);
+    let out = e.run(c, None);
+    let t = text(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a failing key fails the command: {t}"
+    );
+    assert!(
+        t.contains("STRIPE_SECRET_KEY") && t.contains("ok: Stripe accepted it · acct_123 · Acme"),
+        "{t}"
+    );
+    assert!(
+        t.contains("RESEND_API_KEY") && t.contains("failing: Resend refused it (401)"),
+        "{t}"
+    );
+    assert!(
+        t.contains("MYSTERY") && t.contains("nothing was sent"),
+        "{t}"
+    );
+    assert!(
+        !t.contains(STRIPE_FAKE) && !t.contains(RESEND_FAKE) && !t.contains("owner@example.com"),
+        "{t}"
+    );
+    assert!(
+        !t.contains("re_****"),
+        "the provider's own words are never printed: {t}"
+    );
+
+    // Each key went to its own provider's path, and the unknown one went nowhere.
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    assert!(
+        seen.iter()
+            .any(|s| s.starts_with("/v1/account ") && s.contains(STRIPE_FAKE)),
+        "{seen:?}"
+    );
+    assert!(
+        seen.iter()
+            .any(|s| s.starts_with("/domains ") && s.contains(RESEND_FAKE)),
+        "{seen:?}"
+    );
+
+    let due = e.ok(&["due"], None);
+    assert!(
+        due.contains("RESEND_API_KEY") && due.contains("FAILING"),
+        "{due}"
+    );
+    assert!(e.ok(&["ls"], None).contains("FAILING check"));
+    let show = e.ok(&["show", "STRIPE_SECRET_KEY", "--env", "prod"], None);
+    assert!(
+        show.contains("status = \"ok\"") && show.contains("acct_123"),
+        "{show}"
+    );
+    assert!(
+        !e.shtum(
+            &["meta", "STRIPE_SECRET_KEY", "--env", "prod", "check=ok"],
+            None
+        )
+        .status
+        .success()
+    );
+
+    // A new value voids the old check.
+    e.ok(
+        &["set", "RESEND_API_KEY", "--env", "prod"],
+        Some("re_fake-rotated-key"),
+    );
+    assert!(
+        !e.ok(&["show", "RESEND_API_KEY", "--env", "prod"], None)
+            .contains("status = ")
+    );
+}
+
+#[test]
+fn check_needs_the_person_for_a_protected_env() {
+    let e = Env::new();
+    e.ok(
+        &["set", "STRIPE_SECRET_KEY", "--env", "prod"],
+        Some(STRIPE_FAKE),
+    );
+    let (base, seen) = providers();
+    let mut c = e.cmd(&["check", "--env", "prod"]);
+    c.env("SHTUM_TEST_PROVIDER_BASE", &base)
+        .env("SHTUM_TEST_PRESENCE", "deny");
+    let out = e.run(c, None);
+    assert!(
+        !out.status.success() && text(&out).contains("not confirmed"),
+        "{}",
+        text(&out)
+    );
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "nothing is sent without the person"
+    );
+}
+
+#[test]
+fn fly_diff_compares_against_what_shtum_last_pushed() {
+    let e = Env::new();
+    e.with_secrets();
+    let bin = e.dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let list = e.dir.path().join("fly-list.json");
+    std::fs::write(&list, r#"[{"name":"RESEND_API_KEY","digest":"d1","status":"Deployed"},{"name":"STRIPE_KEY","digest":"d2","status":"Deployed"}]"#).unwrap();
+    let fake = format!(
+        "#!/bin/sh\n[ \"$2\" = list ] && cat {} && exit 0\ncat > /dev/null\n",
+        list.display()
+    );
+    let fly = bin.join("fly");
+    std::fs::write(&fly, fake).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fly, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let run = |args: &[&str]| {
+        let mut c = e.cmd(args);
+        c.env("PATH", &path);
+        e.run(c, None)
+    };
+
+    let t = text(&run(&["fly", "diff", "--env", "prod", "--app", "my-api"]));
+    assert!(t.contains("shtum never pushed it"), "before any sync: {t}");
+
+    let out = run(&[
+        "fly",
+        "sync",
+        "--env",
+        "prod",
+        "--app",
+        "my-api",
+        "--only",
+        "RESEND_API_KEY,STRIPE_KEY",
+    ]);
+    assert!(out.status.success(), "{}", text(&out));
+    let out = run(&["fly", "diff", "--env", "prod", "--app", "my-api"]);
+    let t = text(&out);
+    assert!(
+        t.contains("RESEND_API_KEY") && t.contains("same as shtum"),
+        "{t}"
+    );
+    assert!(t.contains("PORT") && t.contains("only in shtum"), "{t}");
+
+    // Someone changes one on Fly, another appears there, and shtum rotates a third.
+    std::fs::write(&list, r#"[{"name":"RESEND_API_KEY","digest":"d9","status":"Deployed"},{"name":"STRIPE_KEY","digest":"d2","status":"Deployed"},{"name":"FLY_ONLY","digest":"d3","status":"Deployed"}]"#).unwrap();
+    e.ok(
+        &["set", "STRIPE_KEY", "--env", "prod"],
+        Some("fake-newer-stripe-value"),
+    );
+    let out = run(&["fly", "diff", "--env", "prod", "--app", "my-api"]);
+    let t = text(&out);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        t.contains("RESEND_API_KEY") && t.contains("CHANGED on Fly"),
+        "{t}"
+    );
+    assert!(
+        t.contains("STRIPE_KEY") && t.contains("shtum has a newer value"),
+        "{t}"
+    );
+    assert!(t.contains("FLY_ONLY") && t.contains("only on Fly"), "{t}");
+    assert!(!t.contains(LIVE) && !t.contains(DEV));
 }

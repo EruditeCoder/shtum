@@ -16,10 +16,12 @@ pub fn due_label(m: &Meta, within: i64) -> String {
 
 /// Rotation status, or that the secret was declared and has no value yet.
 pub fn status_label(v: &Vault, m: &Meta, within: i64) -> String {
-    if v.has_value(&m.name, &m.env) {
-        due_label(m, within)
-    } else {
+    if !v.has_value(&m.name, &m.env) {
         "no value yet".into()
+    } else if m.failing() {
+        "FAILING check".into()
+    } else {
+        due_label(m, within)
     }
 }
 
@@ -95,6 +97,31 @@ pub fn show_text(v: &Vault, name: &str, env: Option<&str>) -> Result<String> {
             }
         );
         if v.has_value(&m.name, &e) {
+            if let Some(k) = &m.kind {
+                let mode = m
+                    .mode
+                    .as_deref()
+                    .map(|x| format!(" ({x})"))
+                    .unwrap_or_default();
+                let _ = writeln!(out, "# kind: {k}{mode}");
+            }
+            match &m.check {
+                Some(c) => {
+                    let acct = c
+                        .account
+                        .as_deref()
+                        .map(|a| format!(" · {a}"))
+                        .unwrap_or_default();
+                    let _ = writeln!(out, "# checked {}: {} — {}{acct}", c.at, c.status, c.detail);
+                }
+                None => {
+                    let _ = writeln!(
+                        out,
+                        "# not checked against its provider: shtum check {} --env {e}",
+                        m.name
+                    );
+                }
+            }
             let _ = writeln!(out, "# {}", due_label(&m, 14));
             if let Some(d) = m.next_due() {
                 let _ = writeln!(out, "# next due {d}");
@@ -120,10 +147,20 @@ pub fn due_text(v: &Vault, within: i64) -> Result<String> {
     let mut rows: Vec<(i64, String)> = vec![];
     let mut none = vec![];
     let mut empty = vec![];
+    let mut failing = vec![];
     for m in v.list(None)? {
         if !v.has_value(&m.name, &m.env) {
             empty.push(format!("{}/{}", m.env, m.name));
             continue;
+        }
+        if let Some(c) = m.check.as_ref().filter(|c| c.status == "failing") {
+            failing.push(format!(
+                "{:<6} {:<32} FAILING since {}: {}",
+                m.env,
+                m.name,
+                &c.at[..10.min(c.at.len())],
+                c.detail
+            ));
         }
         match m.due(today(), within) {
             Due::Overdue(d) => {
@@ -136,6 +173,12 @@ pub fn due_text(v: &Vault, within: i64) -> Result<String> {
     }
     rows.sort();
     let mut out = String::new();
+    for f in &failing {
+        let _ = writeln!(out, "{f}");
+    }
+    if !failing.is_empty() {
+        let _ = writeln!(out);
+    }
     if rows.is_empty() {
         let _ = writeln!(out, "Nothing due in the next {within} days.");
     }

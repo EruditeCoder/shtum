@@ -64,7 +64,35 @@ pub struct Change {
     pub note: Option<String>,
 }
 
-/// Everything about a secret except its value. Agents may read and edit all of it.
+/// What a provider said about a value when it was last checked.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Check {
+    /// When, as an RFC 3339 local time.
+    pub at: String,
+    /// `ok` (the provider accepted it), `failing` (the provider refused it) or `unknown`
+    /// (it could not be checked, or the provider could not be reached).
+    pub status: String,
+    /// One line in shtum's own words, never the provider's message, which can quote the key.
+    pub detail: String,
+    /// The account the provider says it belongs to, when it says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+}
+
+/// A deploy target's copy, as seen right after shtum pushed it.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Deployed {
+    /// The target's own digest of the value. Fly's is keyed, so it can only be compared with
+    /// another digest from the same app, never computed from a value.
+    pub digest: String,
+    /// shtum's fingerprint of the value that was pushed.
+    pub fingerprint: String,
+    pub date: NaiveDate,
+}
+
+/// Everything about a secret except its value. Agents may read and edit most of it; the
+/// fields shtum works out itself (fingerprint, history, kind, mode, check, deployed) are
+/// refused by `set_field`.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Meta {
     pub name: String,
@@ -100,9 +128,23 @@ pub struct Meta {
     pub fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+    /// What the value is, read from its prefix when it was stored or checked, such as
+    /// "Stripe secret key". Never the value, and never set by hand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// `live` or `test`, when the prefix says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
     /// Fields an agent invents (`shtum meta X region=eu`), kept as strings.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, String>,
+    /// The last time `shtum check` asked the provider whether the value still works.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<Check>,
+    /// What each deploy target held when shtum last pushed this secret to it, keyed like
+    /// `fly:my-api`, so a later `shtum fly diff` can tell whether it was changed since.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub deployed: BTreeMap<String, Deployed>,
     /// Every value this secret has held, by fingerprint, newest last.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub history: Vec<Change>,
@@ -135,9 +177,18 @@ impl Meta {
             created: today(),
             fingerprint: None,
             notes: None,
+            kind: None,
+            mode: None,
             extra: BTreeMap::new(),
+            check: None,
+            deployed: BTreeMap::new(),
             history: vec![],
         }
+    }
+
+    /// Whether the last online check found the value refused.
+    pub fn failing(&self) -> bool {
+        self.check.as_ref().is_some_and(|c| c.status == "failing")
     }
 
     /// When this secret next needs attention: a rotation falling due or an expiry,
@@ -215,7 +266,8 @@ impl Meta {
             }
             "last_rotated" => self.last_rotated = date()?,
             "expires" => self.expires = date()?,
-            "name" | "env" | "created" | "fingerprint" | "history" | "extra" => {
+            "name" | "env" | "created" | "fingerprint" | "history" | "extra" | "kind" | "mode"
+            | "check" | "deployed" | "account" => {
                 bail!("{key} is maintained by shtum and cannot be set")
             }
             other => {

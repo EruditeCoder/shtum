@@ -8,6 +8,7 @@
 mod crypto;
 mod dotenv;
 mod hook;
+mod keys;
 mod mcp;
 mod ops;
 mod presence;
@@ -125,6 +126,27 @@ enum Cmd {
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
+    /// Is a value you hold the one stored? Reads it from a hidden prompt or stdin (or a whole
+    /// .env with --file), compares fingerprints, and stores nothing.
+    Compare {
+        name: Option<String>,
+        #[arg(long)]
+        env: String,
+        /// Compare every key in this .env file instead of one value.
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
+    /// What each key is (from its prefix) and whether its provider still accepts it. Records the
+    /// result; prints no value. A protected env asks for Touch ID once.
+    Check {
+        /// One secret; every secret with a value in the env when left out.
+        name: Option<String>,
+        #[arg(long)]
+        env: String,
+        /// Only read the kind from the prefix; ask no provider.
+        #[arg(long)]
+        offline: bool,
+    },
     /// Deploy targets.
     #[command(subcommand)]
     Fly(FlyCmd),
@@ -179,6 +201,14 @@ enum FlyCmd {
         /// Set them without restarting machines.
         #[arg(long)]
         stage: bool,
+    },
+    /// Compare an env with a Fly app's secrets: what matches what shtum last pushed, what was
+    /// changed on Fly since, and what is only on one side. Reads no value.
+    Diff {
+        #[arg(long)]
+        env: String,
+        #[arg(long)]
+        app: String,
     },
 }
 
@@ -255,6 +285,9 @@ fn dispatch(cmd: Cmd) -> Result<i32> {
             only,
             stage,
         }) => fly_sync(&env, &app, &only, stage),
+        Cmd::Fly(FlyCmd::Diff { env, app }) => fly_diff(&env, &app),
+        Cmd::Compare { name, env, file } => compare(name.as_deref(), &env, file.as_deref()),
+        Cmd::Check { name, env, offline } => check(name.as_deref(), &env, offline),
         Cmd::Reveal { name, env } => reveal(&name, &env),
         Cmd::BackupKey { env } => backup_key(&env),
         Cmd::Doc(c) => doc(c),
@@ -437,6 +470,9 @@ fn store(
     let rotated = m.fingerprint.is_some();
     v.write_value(name, env, &crypto::encrypt(v.recipient(env)?, value)?)?;
     m.fingerprint = Some(fp.clone());
+    note_kind(&mut m, value);
+    // A check was about the old value.
+    m.check = None;
     m.history.push(Change {
         date: today(),
         fingerprint: fp,
@@ -713,8 +749,283 @@ fn fly_sync(env: &str, app: &str, only: &[String], stage: bool) -> Result<i32> {
                 v.save(&m)?;
             }
         }
+        let names: Vec<String> = vars.iter().map(|(n, _)| n.clone()).collect();
+        record_deploy(&v, env, app, &names);
     }
     Ok(code)
+}
+
+/// Record what a value is from its prefix. A provider named by hand is kept; one shtum
+/// recognises fills an empty field.
+fn note_kind(m: &mut Meta, value: &[u8]) {
+    match keys::classify(value, &m.name, m.provider.as_deref()) {
+        Some(k) => {
+            m.kind = Some(k.kind.into());
+            m.mode = k.mode.map(String::from);
+            if m.provider.is_none() {
+                m.provider = Some(k.provider.into());
+            }
+        }
+        None => {
+            m.kind = None;
+            m.mode = None;
+        }
+    }
+}
+
+fn kind_label(m: &Meta) -> String {
+    match (&m.kind, &m.mode) {
+        (Some(k), Some(mode)) => format!("{k} ({mode})"),
+        (Some(k), None) => k.clone(),
+        _ => "kind unknown".into(),
+    }
+}
+
+/// How a value someone holds relates to the stored one, by fingerprint alone.
+fn compare_one(v: &Vault, name: &str, env: &str, value: &[u8]) -> (bool, String) {
+    if !v.has(name, env) {
+        return (false, "not in shtum".into());
+    }
+    let Ok(m) = v.load(name, env) else {
+        return (false, "its record could not be read".into());
+    };
+    let Some(stored) = m.fingerprint.as_deref().filter(|_| v.has_value(name, env)) else {
+        return (false, "has no value stored yet".into());
+    };
+    let yours = crypto::fingerprint(&v.config.salt, value);
+    if yours == stored {
+        return (true, format!("same as the stored value ({stored})"));
+    }
+    let mut out = format!("DIFFERENT from the stored value (stored {stored}, yours {yours})");
+    let theirs = keys::classify(value, name, m.provider.as_deref());
+    if let Some(t) = theirs {
+        let yours_kind = match t.mode {
+            Some(mode) => format!("{} ({mode})", t.kind),
+            None => t.kind.to_string(),
+        };
+        let stored_kind = kind_label(&m);
+        if yours_kind != stored_kind {
+            out.push_str(&format!(
+                "; yours is a {yours_kind}, the stored one a {stored_kind}"
+            ));
+        }
+    }
+    if m.history.iter().any(|c| c.fingerprint == yours) {
+        out.push_str("; yours is an earlier value this secret once held");
+    }
+    (false, out)
+}
+
+/// Compare without storing: a fingerprint is taken of what you hold and set beside the stored
+/// one. No decryption, so no Touch ID; the stored fingerprints are in the metadata already.
+fn compare(name: Option<&str>, env: &str, file: Option<&Path>) -> Result<i32> {
+    let v = Vault::open()?;
+    v.recipient(env)?;
+    if let Some(f) = file {
+        let text = Zeroizing::new(
+            std::fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?,
+        );
+        let mut all_same = true;
+        for (n, value) in dotenv::parse(&text)? {
+            let value = Zeroizing::new(value);
+            if name.is_some_and(|only| only != n) || value.is_empty() {
+                continue;
+            }
+            let (same, what) = compare_one(&v, &n, env, value.as_bytes());
+            all_same &= same;
+            println!("{n:<36} {what}");
+        }
+        return Ok(if all_same { 0 } else { 1 });
+    }
+    let name = name.context("name the secret, or pass --file with a .env to compare")?;
+    Vault::check(name, env)?;
+    let value = if std::io::stdin().is_terminal() {
+        Zeroizing::new(
+            rpassword::prompt_password(format!("Value to compare with {name} (hidden): "))?
+                .into_bytes(),
+        )
+    } else {
+        read_value(name)?
+    };
+    let value = Zeroizing::new(String::from_utf8_lossy(&value).trim().as_bytes().to_vec());
+    let (same, what) = compare_one(&v, name, env, &value);
+    println!("{name} in {env}: {what}. Nothing was stored.");
+    Ok(if same { 0 } else { 1 })
+}
+
+/// Read each value's kind, and ask its provider whether it still works. Prints and records
+/// shtum's own summary, never the value or the provider's words.
+fn check(name: Option<&str>, env: &str, offline: bool) -> Result<i32> {
+    let v = Vault::open()?;
+    v.recipient(env)?;
+    let names: Vec<String> = match name {
+        Some(n) => {
+            v.load(n, env)?;
+            if !v.has_value(n, env) {
+                bail!(
+                    "{n} in {env} has no value yet — fill it at your terminal: shtum set {n} --env {env}"
+                );
+            }
+            vec![n.to_string()]
+        }
+        None => v
+            .list(Some(env))?
+            .into_iter()
+            .map(|m| m.name)
+            .filter(|n| v.has_value(n, env))
+            .collect(),
+    };
+    if names.is_empty() {
+        println!("Nothing to check: {env} has no values.");
+        return Ok(0);
+    }
+    let ring = Keyring::for_vault(&v);
+    let identity = crypto::unlock(&v, &ring, env, &format!("check keys in {env}"))?;
+    let mut failing = 0;
+    for n in &names {
+        let value = crypto::open_with(&v, &identity, n, env)?;
+        let mut m = v.load(n, env)?;
+        note_kind(&mut m, &value);
+        let line = if offline {
+            kind_label(&m)
+        } else {
+            match keys::classify(&value, n, m.provider.as_deref()) {
+                Some(k) => {
+                    let c = keys::check(&k, &value);
+                    if c.status == "failing" {
+                        failing += 1;
+                    }
+                    let acct = c
+                        .account
+                        .as_deref()
+                        .map(|a| format!(" · {a}"))
+                        .unwrap_or_default();
+                    let s = format!("{}  {}: {}{acct}", kind_label(&m), c.status, c.detail);
+                    m.check = Some(c);
+                    s
+                }
+                None => format!(
+                    "{}  unknown: shtum does not know this provider's keys, so nothing was sent",
+                    kind_label(&m)
+                ),
+            }
+        };
+        if let Some(exp) = m.expires.filter(|e| *e < today()) {
+            println!("{n:<32} {line}  · EXPIRED {exp}");
+        } else {
+            println!("{n:<32} {line}");
+        }
+        v.save(&m)?;
+    }
+    Ok(if failing > 0 { 1 } else { 0 })
+}
+
+/// A Fly app's secrets as name → digest. Digests only: Fly never returns a value.
+fn fly_list(app: &str) -> Result<std::collections::BTreeMap<String, String>> {
+    let out = std::process::Command::new("fly")
+        .args(["secrets", "list", "-a", app, "--json"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .context("running fly (is flyctl installed?)")?;
+    if !out.status.success() {
+        bail!(
+            "fly secrets list -a {app} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_slice(&out.stdout).context("fly secrets list did not answer in JSON")?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            let name = r.get("name").or_else(|| r.get("Name"))?.as_str()?;
+            let digest = r.get("digest").or_else(|| r.get("Digest"))?.as_str()?;
+            Some((name.to_string(), digest.to_string()))
+        })
+        .collect())
+}
+
+/// Note what Fly holds for each secret just pushed, so `fly diff` can tell later edits apart.
+fn record_deploy(v: &Vault, env: &str, app: &str, names: &[String]) {
+    let digests = match fly_list(app) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("shtum: pushed, but could not read Fly's digests to track them: {e:#}");
+            return;
+        }
+    };
+    let tag = format!("fly:{app}");
+    for n in names {
+        let (Some(d), Ok(mut m)) = (digests.get(n), v.load(n, env)) else {
+            continue;
+        };
+        let Some(fp) = m.fingerprint.clone() else {
+            continue;
+        };
+        m.deployed.insert(
+            tag.clone(),
+            vault::Deployed {
+                digest: d.clone(),
+                fingerprint: fp,
+                date: today(),
+            },
+        );
+        let _ = v.save(&m);
+    }
+}
+
+/// Fly's digest is keyed, so it cannot be computed from a value; it can be compared with the
+/// digest Fly gave when shtum last pushed, which is what this does.
+fn fly_diff(env: &str, app: &str) -> Result<i32> {
+    let v = Vault::open()?;
+    v.recipient(env)?;
+    let fly = fly_list(app)?;
+    let tag = format!("fly:{app}");
+    let mine: std::collections::BTreeMap<String, Meta> = v
+        .list(Some(env))?
+        .into_iter()
+        .filter(|m| v.has_value(&m.name, env))
+        .map(|m| (m.name.clone(), m))
+        .collect();
+    let mut names: Vec<&String> = mine.keys().chain(fly.keys()).collect();
+    names.sort();
+    names.dedup();
+    let mut differ = 0;
+    for n in names {
+        let what = match (mine.get(n), fly.get(n)) {
+            (Some(m), Some(digest)) => match m.deployed.get(&tag) {
+                None => {
+                    differ += 1;
+                    "on both; shtum never pushed it, so it cannot say whether they match \
+                     (shtum fly sync --only it to start tracking)"
+                        .to_string()
+                }
+                Some(d) if &d.digest != digest => {
+                    differ += 1;
+                    format!("CHANGED on Fly since shtum pushed it on {}", d.date)
+                }
+                Some(d) if m.fingerprint.as_deref() != Some(d.fingerprint.as_str()) => {
+                    differ += 1;
+                    format!(
+                        "shtum has a newer value; Fly still has the one pushed {}",
+                        d.date
+                    )
+                }
+                Some(d) => format!("same as shtum (pushed {})", d.date),
+            },
+            (Some(_), None) => {
+                differ += 1;
+                "only in shtum".into()
+            }
+            (None, Some(_)) => {
+                differ += 1;
+                format!("only on Fly (not in shtum's {env})")
+            }
+            (None, None) => continue,
+        };
+        println!("{n:<36} {what}");
+    }
+    Ok(if differ > 0 { 1 } else { 0 })
 }
 
 /// Only a person at a terminal can pass this: an agent's shell has none.

@@ -24,6 +24,8 @@ running as your user could.
 | Production used without you | Protected envs ask for Touch ID or your password (`LAPolicyDeviceOwnerAuthentication`) for every run, sync, reveal, replacement and deletion. There is no time-based caching. |
 | Another program reading the Keychain item | Measured: `security find-generic-password -w` on shtum's item opens a macOS prompt instead of returning the key. The hook also refuses it. |
 | Another program deleting the Keychain item | Measured: deleting needs **no** prompt. The hook refuses it, and `shtum backup-key` exists so a deleted or lost key can be restored. |
+| `shtum check` sending a key somewhere it shouldn't go | Each provider's address is written in the code, and the value's own prefix picks the provider. The editable `provider` field matters only for a value with no telling prefix (a SerpAPI key), and even then it picks from that fixed list, never an address. Redirects are not followed. The provider's reply is never printed: an error can quote part of the key, so shtum reports a status in its own words and reads only named fields. The test switch that points every provider at a local server is compiled into debug builds only. |
+| `shtum compare` used as an oracle | It compares fingerprints, which are already in the plaintext metadata, so it gives away nothing new. Like any fingerprint, it is no protection for a low-entropy secret. |
 | Reading a child's environment with `ps` | Measured on macOS 26: `ps -E` / `ps eww` do not show another process's environment. |
 
 ## Known gaps
@@ -34,8 +36,10 @@ running as your user could.
 - A program run under `shtum run` can write a value to a file, and an agent can then read that file.
 - The hook matches command text, not the actual shell grammar. It is a guard rail and will
   miss creative spellings.
-- The test-only override `SHTUM_TEST_PRESENCE` is compiled into **debug builds only** and only
-  works with the file keyring. A release build ignores it.
+- `shtum check` really sends the key, over HTTPS, to the provider that issued it. Do that only on purpose. Perplexity and Jina have no free read-only call, so shtum sends a deliberately empty request; a key they accept is expected to answer "malformed" (4xx). Those two paths were confirmed only with keys they refuse.
+- `shtum fly diff` trusts that Fly gives an unchanged value the same digest. If Fly ever re-keys its digests, every secret will read as changed until it is pushed again.
+- The test-only overrides `SHTUM_TEST_PRESENCE` and `SHTUM_TEST_PROVIDER_BASE` are compiled into **debug builds only**, and the presence override works only with the
+  file keyring. A release build contains neither.
 - Each rebuild of the binary changes its code signature, so macOS asks again before letting it
   read the Keychain. That is expected.
 

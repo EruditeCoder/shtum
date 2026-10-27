@@ -109,6 +109,41 @@ only = ["RESEND_API_KEY", "STRIPE_SECRET_KEY"]   # optional; default is the whol
 shtum fly sync --env prod --app my-api --stage
 ```
 
+To see whether Fly still has what shtum pushed:
+
+```sh
+shtum fly diff --env prod --app my-api
+```
+
+Fly's digest of a secret is keyed, so it can't be worked out from a value. Instead, `shtum fly sync` records the digest Fly reports right after each push, and `fly diff` compares against it. Each secret reads *same as shtum*, *CHANGED on Fly since shtum pushed it*, *shtum has a newer value*, *only in shtum*, *only on Fly*, or *shtum never pushed it* (push it once with `--only` to start tracking).
+
+### Compare a value you hold
+
+Is the key in your clipboard the one already stored? `compare` reads it from a hidden prompt or stdin, compares fingerprints and stores nothing. It records no rotation and needs no Touch ID.
+
+```sh
+shtum compare STRIPE_SECRET_KEY --env prod         # same / DIFFERENT
+shtum compare --file ~/Downloads/new.env --env prod  # every key in a file
+```
+
+A different value is also told apart by kind (*yours is a Stripe secret key (test), the stored one a Stripe secret key (live)*) and when it matches an earlier value the secret once held.
+
+### Check keys against their providers
+
+```sh
+shtum check --env prod                 # every key; prod asks for Touch ID once
+shtum check STRIPE_SECRET_KEY --env prod
+shtum check --env dev --offline        # only the kind, read from the prefix
+```
+
+A key's **kind** and **mode** come from its prefix (`sk_live_`, `rk_test_`, `pk_live_`, `whsec_`, `sk-ant-api`, `re_`, `pplx-`, `jina_`, `ghp_`, `sk-proj-` and others), recorded whenever a value is stored. `check` then makes one cheap read-only call to the key's own provider: Stripe, Resend, Anthropic, OpenAI, Perplexity, Jina, GitHub or SerpAPI. It records *ok*, *failing* (refused: rolled, expired, revoked or mistyped) or *unknown*, plus the account the provider names where it names one (`acct_… · Your Business`). `shtum ls`, `show` and `due` flag failing keys.
+
+Providers rarely tell you when a key will expire (Stripe shows a rolled key's expiry only in its dashboard), so record it yourself and `due` will warn before then:
+
+```sh
+shtum meta STRIPE_SECRET_KEY --env prod expires=2026-11-03
+```
+
 ### Rotations
 
 Replacing a value with `shtum set` records a rotation. `last_rotated` moves to today, and the history gains the new value's **fingerprint**: a salted hash prefix that shows whether two copies match without revealing either.
